@@ -13,7 +13,7 @@
 ## 安装
 
 ```bash
-git clone https://github.com/AzenDev2026/<仓库名>.git   # 或网页下载解压
+git clone https://github.com/AzenDev2026/sysfetch.git   # 或网页下载解压
 cd <仓库名>
 ./install.sh
 source ~/.bashrc    # 或者直接新开一个终端
