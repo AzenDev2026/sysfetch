@@ -1,0 +1,530 @@
+#!/usr/bin/env python3
+"""
+sysfetch - 一个基于配置文件的系统信息展示工具（fastfetch 风格）
+类似 fastfetch/hyfetch，但使用 conf.txt 自定义配置
+
+配置文件查找顺序：
+1. ~/.config/sysfetch/conf.txt      （用户自定义）
+2. ~/.local/share/sysfetch/conf.txt （安装目录默认配置）
+3. 脚本所在目录（开发模式）
+
+配置文件格式:
+{ascii-logo} : blue
+nvazen.png          # 图片(png/jpg) 或 文本 ascii 文件路径（相对路径基于 conf 所在目录）
+
+{sys-info} :
+/etc/os-release
+"""
+
+import os
+import sys
+import platform
+import socket
+import re
+import shutil
+import subprocess
+import glob
+from pathlib import Path
+from datetime import datetime
+
+# 最大支持的 ASCII 行数
+MAX_ASCII_LINES = 100
+
+# ANSI 颜色代码
+class Colors:
+    RESET = '\033[0m'
+    BOLD = '\033[1m'
+    RED = '\033[91m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    BLUE = '\033[94m'
+    MAGENTA = '\033[95m'
+    CYAN = '\033[96m'
+    WHITE = '\033[97m'
+    GRAY = '\033[90m'
+
+
+# 16 种常用颜色名称 -> ANSI 转义序列
+COLOR_MAP = {
+    'black':        '\033[30m',
+    'red':          '\033[31m',
+    'green':        '\033[32m',
+    'yellow':       '\033[33m',
+    'blue':         '\033[34m',
+    'magenta':      '\033[35m',
+    'cyan':         '\033[36m',
+    'white':        '\033[37m',
+    'darkgray':     '\033[90m',
+    'darkgrey':     '\033[90m',
+    'lightred':     '\033[91m',
+    'lightgreen':   '\033[92m',
+    'lightyellow':  '\033[93m',
+    'lightblue':    '\033[94m',
+    'lightmagenta': '\033[95m',
+    'lightcyan':    '\033[96m',
+    'lightwhite':   '\033[97m',
+    'gray':         '\033[90m',
+    'grey':         '\033[90m',
+    'purple':       '\033[35m',
+    'lightpurple':  '\033[95m',
+    'orange':       '\033[38;5;208m',
+    'pink':         '\033[38;5;213m',
+}
+
+COLOR_RESET = '\033[0m'
+
+
+class Config:
+    def __init__(self):
+        self.ascii_path = None
+        self.ascii_color = None
+        self.sysinfo_path = None
+
+
+def parse_conf(conf_path):
+    config = Config()
+
+    if not os.path.isfile(conf_path):
+        print(f"{Colors.RED}[错误] 配置文件不存在: {conf_path}{Colors.RESET}")
+        sys.exit(1)
+
+    try:
+        with open(conf_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+    except Exception as e:
+        print(f"{Colors.RED}[错误] 无法读取配置文件: {e}{Colors.RESET}")
+        sys.exit(1)
+
+    content = content.replace('\r\n', '\n').replace('\r', '\n')
+    lines = content.splitlines()
+
+    section_re = re.compile(r'^\s*\{([a-zA-Z0-9_\-]+)\}\s*:\s*([a-zA-Z]*)\s*$')
+
+    state = None
+    ascii_found = False
+    sysinfo_found = False
+
+    for lineno, raw_line in enumerate(lines, 1):
+        line = raw_line
+        hash_pos = line.find('#')
+        if hash_pos != -1:
+            line = line[:hash_pos]
+
+        line = line.rstrip()
+        stripped = line.strip()
+
+        if not stripped:
+            continue
+
+        m = section_re.match(stripped)
+        if m:
+            section_name = m.group(1)
+            color_arg = m.group(2).strip().lower() if m.group(2) else ''
+
+            if section_name == 'ascii-logo':
+                state = 'ascii'
+                ascii_found = True
+                if color_arg:
+                    if color_arg not in COLOR_MAP:
+                        print(f"{Colors.RED}[错误] 第 {lineno} 行: 未知的颜色 '{color_arg}'。{Colors.RESET}")
+                        sys.exit(1)
+                    config.ascii_color = color_arg
+            elif section_name == 'sys-info':
+                state = 'sysinfo'
+                sysinfo_found = True
+                if color_arg:
+                    print(f"{Colors.RED}[错误] 第 {lineno} 行: {{sys-info}} 段头不能带颜色{Colors.RESET}")
+                    sys.exit(1)
+            else:
+                sys.exit(1)
+            continue
+
+        if state == 'ascii':
+            config.ascii_path = stripped
+        elif state == 'sysinfo':
+            config.sysinfo_path = stripped
+
+    conf_dir = os.path.dirname(os.path.abspath(conf_path))
+
+    def _resolve(p):
+        p = os.path.expanduser(os.path.expandvars(p))
+        if not os.path.isabs(p):
+            p = os.path.join(conf_dir, p)
+        return os.path.normpath(p)
+
+    config.ascii_path = _resolve(config.ascii_path)
+    config.sysinfo_path = _resolve(config.sysinfo_path)
+
+    return config
+
+
+# ============================================================
+# 系统数据收集函数（保持原样）
+# ============================================================
+
+def parse_os_release(path):
+    if not os.path.isfile(path):
+        return {}
+    info = {}
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if '=' in line:
+                    key, _, value = line.partition('=')
+                    info[key.strip()] = value.strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return info
+
+def run_cmd(cmd, timeout=2):
+    try:
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        if result.returncode == 0: return result.stdout.strip()
+    except Exception: pass
+    return None
+
+def get_user_host():
+    return os.environ.get('USER', 'user'), socket.gethostname()
+
+def get_os_name(os_info):
+    return os_info.get('PRETTY_NAME') or os_info.get('NAME') or platform.system()
+
+def get_kernel(): return platform.release()
+
+def get_uptime():
+    try:
+        with open('/proc/uptime', 'r') as f: uptime_seconds = float(f.read().split()[0])
+        hours = int((uptime_seconds % 86400) // 3600)
+        minutes = int((uptime_seconds % 3600) // 60)
+        return f"{hours} hours, {minutes} mins"
+    except Exception: return "Unknown"
+
+def get_packages():
+    parts = []
+    if os.path.isdir('/var/lib/pacman/local'):
+        parts.append(f"{len(os.listdir('/var/lib/pacman/local'))} (pacman)")
+    if os.path.isfile('/var/lib/dpkg/status'):
+        parts.append("Debian (dpkg)")
+    return ", ".join(parts) if parts else "Unknown"
+
+def get_shell():
+    return os.path.basename(os.environ.get('SHELL', 'sh'))
+
+def get_terminal():
+    return os.environ.get('TERM_PROGRAM') or os.environ.get('TERM', 'unknown')
+
+
+def read_first(path):
+    """读取文件第一行内容（用于 /sys 下的设备信息）"""
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            v = f.read().strip()
+            return v if v else None
+    except Exception:
+        return None
+
+
+def human_size(n):
+    for unit in ('B', 'KiB', 'MiB', 'GiB', 'TiB'):
+        if n < 1024:
+            return f"{n:.0f} {unit}" if unit == 'B' else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PiB"
+
+
+def get_host():
+    vendor = read_first('/sys/devices/virtual/dmi/id/sys_vendor')
+    product = read_first('/sys/devices/virtual/dmi/id/product_name')
+    if product:
+        return f"{vendor} {product}".strip() if vendor else product
+    return platform.node() or "Unknown"
+
+
+def get_de():
+    de = os.environ.get('XDG_CURRENT_DESKTOP') or os.environ.get('DESKTOP_SESSION') or ''
+    if de.lower() in ('kde', 'kde-plasma', 'plasma'):
+        return 'KDE Plasma'
+    return de or 'Unknown'
+
+
+def get_wm():
+    if get_de() == 'KDE Plasma':
+        return 'KWin (Wayland)' if os.environ.get('WAYLAND_DISPLAY') else 'KWin (X11)'
+    session = os.environ.get('XDG_SESSION_TYPE')
+    return f"Unknown ({session})" if session else 'Unknown'
+
+
+def get_resolution():
+    ansi_re = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+    out = run_cmd("kscreen-doctor -o")
+    if out:
+        clean = ansi_re.sub('', out)
+        # 活动分辨率（物理）：Modes 行里带 * 的项，如 2560x1600@120.00*
+        m = re.search(r'(\d+x\d+)@[\d.]+\*', clean)
+        if m:
+            res = m.group(1)
+            s = re.search(r'Scale:\s*([0-9.]+)', clean)
+            if s:
+                res += f" @ {s.group(1)}x"
+            return res
+        # 兜底：Geometry 行（逻辑分辨率）
+        m = re.search(r'Geometry:\s*\d+,\d+\s+(\d+x\d+)', clean)
+        if m:
+            return m.group(1)
+    out2 = run_cmd("xrandr --current")
+    if out2:
+        m = re.search(r'\bconnected\b[^\n]*?(\d+x\d+)', out2)
+        if m:
+            return m.group(1)
+    return "Unknown"
+
+
+def get_gpu():
+    out = run_cmd("lspci -mm | grep -iE 'vga|3d controller|display controller'")
+    if not out:
+        return None
+    for line in out.splitlines():
+        # 截掉 -r01 -p00 之后的子系统信息（那部分不是型号）
+        line = line.split(' -')[0]
+        parts = [p.strip() for p in line.split('"') if p.strip()]
+        # 格式: 地址 "类别" "厂商" "型号"
+        if len(parts) >= 4:
+            return parts[3]
+        if len(parts) == 3:
+            return parts[2]
+    return None
+
+
+def get_disk():
+    try:
+        total, used, free = shutil.disk_usage('/')
+        pct = used / total * 100 if total else 0
+        return f"{human_size(used)} / {human_size(total)} ({pct:.0f}%)"
+    except Exception:
+        return "Unknown"
+
+
+def get_battery():
+    bats = sorted(glob.glob('/sys/class/power_supply/BAT*'))
+    if not bats:
+        return None
+    cap = read_first(os.path.join(bats[0], 'capacity'))
+    if cap is None:
+        return None
+    status = (read_first(os.path.join(bats[0], 'status')) or '').lower()
+    if status == 'charging':
+        return f"{cap}% (charging)"
+    if status == 'discharging':
+        return f"{cap}% (discharging)"
+    return f"{cap}%"
+
+
+def get_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return None
+
+
+def get_locale():
+    return os.environ.get('LANG') or 'Unknown'
+
+def get_cpu():
+    try:
+        with open('/proc/cpuinfo', 'r') as f:
+            for line in f:
+                if line.startswith('model name'):
+                    return line.split(':', 1)[1].strip()
+    except Exception: pass
+    return "Unknown CPU"
+
+def get_memory():
+    try:
+        with open('/proc/meminfo', 'r') as f:
+            total = int(f.readline().split()[1])
+            free = int(f.readline().split()[1])
+            return f"{(total-free)/1024/1024:.1f} GiB / {total/1024/1024:.1f} GiB"
+    except Exception: return "Unknown"
+
+def get_system_info(os_info):
+    pairs = [
+        ("OS", get_os_name(os_info)),
+        ("Host", get_host()),
+        ("Kernel", get_kernel()),
+        ("Uptime", get_uptime()),
+        ("Packages", get_packages()),
+        ("Shell", get_shell()),
+        ("DE", get_de()),
+        ("WM", get_wm()),
+        ("Resolution", get_resolution()),
+        ("Terminal", get_terminal()),
+        ("CPU", get_cpu()),
+        ("GPU", get_gpu()),
+        ("Memory", get_memory()),
+        ("Disk", get_disk()),
+        ("Battery", get_battery()),
+        ("Local IP", get_local_ip()),
+        ("Locale", get_locale()),
+        ("Time", datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
+    ]
+    return [(k, v) for k, v in pairs if v]
+
+
+def build_info_lines(info_pairs, user, hostname):
+    lines = []
+    lines.append(f"{Colors.CYAN}{user}{Colors.RESET}@{Colors.CYAN}{hostname}{Colors.RESET}")
+    lines.append(f"{Colors.GRAY}{'-' * (len(user) + len(hostname) + 1)}{Colors.RESET}")
+    max_label = max((len(label) for label, _ in info_pairs), default=0)
+    for label, value in info_pairs:
+        label_padded = label.ljust(max_label)
+        lines.append(f"{Colors.YELLOW}{label_padded}{Colors.RESET}: {value}")
+    # 底部彩色块（fastfetch 风格）
+    color_blocks = "  ".join(f"\033[48;5;{c}m   \033[0m" for c in (1, 2, 3, 4, 5, 6, 7, 8))
+    lines.append(color_blocks)
+    return lines
+
+# ============================================================
+# 核心改造：混合渲染逻辑（图像光标定位）
+# ============================================================
+
+def is_image_file(path):
+    """通过后缀简单判断是否为图片"""
+    return path.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'))
+
+def is_kitty_capable():
+    """判断当前终端是否支持 kitty 图形协议"""
+    if os.environ.get('KITTY_WINDOW_ID'):
+        return True
+    term_program = os.environ.get('TERM_PROGRAM', '').lower()
+    if term_program in ('kitty', 'wezterm', 'ghostty'):
+        return True
+    return os.environ.get('TERM', '') in ('xterm-kitty', 'xterm-ghostty')
+
+
+def print_with_image_mode(image_path, info_lines):
+    """
+    图像模式（自动选择渲染方式）：
+    1. kitty/WezTerm/Ghostty 终端 -> chafa 高清 kitty 图形协议（直接写 stdout，不能捕获）
+    2. 其他终端（Konsole、DeepTerminal 等）-> chafa 彩色字符块（256 色，任何终端可显示）
+    3. chafa 不可用/失败 -> 只输出系统信息，不崩溃
+    """
+    img_width = 36
+    img_height = 18
+    info_offset = img_width + 4
+
+    try:
+        if is_kitty_capable():
+            # kitty 原生图像协议：必须原样直出到 stdout，否则协议数据会被破坏
+            # --probe=off 禁用终端能力探测（否则在无应答的终端里会卡 5 秒）
+            subprocess.run(
+                ["chafa", "--probe=off", "--format", "kitty",
+                 "--size", f"{img_width}x{img_height}", image_path])
+        else:
+            # 通用终端：彩色字符块，限制 256 色（兼容 pyte 等模拟器）
+            result = subprocess.run(
+                ["chafa", "--probe=off", "--format", "symbols", "--colors", "256",
+                 "--size", f"{img_width}x{img_height}", image_path],
+                capture_output=True, text=True, timeout=5)
+            if result.returncode != 0 or not result.stdout.strip():
+                for line in info_lines:
+                    print(line)
+                return
+            sys.stdout.write(result.stdout)
+            # 如果字符块不足 img_height 行，补空行保证后续光标定位正确
+            rows = result.stdout.count('\n')
+            if rows < img_height:
+                sys.stdout.write('\n' * (img_height - rows))
+            # 按实际图像宽度计算信息列偏移（去掉 ANSI 转义码和行尾填充空格后取最宽行）
+            ansi_re = re.compile(r'\x1b\[[0-9;?]*[a-zA-Z]')
+            clean_lines = [ansi_re.sub('', ln).rstrip() for ln in result.stdout.splitlines() if ln.strip()]
+            actual_width = max((len(ln) for ln in clean_lines), default=img_width)
+            info_offset = actual_width + 3
+    except Exception:
+        for line in info_lines:
+            print(line)
+        return
+
+    # 光标回到图像顶部（先回车把列位置归零，避免 chafa 尾部控制码残留偏移），
+    # 再向右偏移，把系统信息逐行贴到图像右侧
+    sys.stdout.write(f"\r\033[{img_height}A")
+    for line in info_lines:
+        sys.stdout.write(f"\033[{info_offset}C{line}\n")
+
+    # 系统信息比图像矮时，把剩余行补掉，避免终端提示符错位
+    remaining_lines = img_height - len(info_lines)
+    if remaining_lines > 0:
+        sys.stdout.write("\n" * remaining_lines)
+    print()
+
+
+def print_with_ascii_mode(ascii_path, info_lines, ascii_color):
+    """传统的文本 ASCII 渲染（保留你原本的逻辑作为兼容备份）"""
+    try:
+        with open(ascii_path, 'r', encoding='utf-8') as f:
+            ascii_lines = f.read().splitlines()
+    except Exception:
+        ascii_lines = [" [无可用ASCII] "]
+
+    color_prefix = COLOR_MAP.get(ascii_color, '') if ascii_color else ''
+    color_suffix = COLOR_RESET if ascii_color else ''
+    
+    # 简单的文本合并
+    ascii_width = max((len(line) for line in ascii_lines), default=0)
+    max_lines = max(len(ascii_lines), len(info_lines))
+    
+    print()
+    for i in range(max_lines):
+        a_part = ascii_lines[i] if i < len(ascii_lines) else ''
+        pad = ascii_width - len(a_part)
+        a_part_padded = a_part + ' ' * max(pad, 0)
+        
+        a_colored = f"{color_prefix}{a_part_padded}{color_suffix}" if color_prefix else a_part_padded
+        i_part = info_lines[i] if i < len(info_lines) else ''
+        
+        if i_part:
+            print(f"{a_colored}   {i_part}")
+        else:
+            print(a_colored.rstrip())
+    print()
+
+
+def find_conf():
+    """按优先级查找配置文件：用户配置 > 安装目录 > 脚本所在目录"""
+    home = Path.home()
+    candidates = [
+        Path(os.environ.get('XDG_CONFIG_HOME') or home / '.config') / 'sysfetch' / 'conf.txt',
+        Path(os.environ.get('XDG_DATA_HOME') or home / '.local' / 'share') / 'sysfetch' / 'conf.txt',
+    ]
+    script_dir = Path(__file__).resolve().parent
+    candidates += [script_dir / 'conf.txt', script_dir / 'assets' / 'conf.txt']
+    for c in candidates:
+        if c.is_file():
+            return c
+    return candidates[0]
+
+
+def main():
+    conf_path = find_conf()
+
+    config = parse_conf(str(conf_path))
+    os_info = parse_os_release(config.sysinfo_path)
+
+    user, hostname = get_user_host()
+    info_pairs = get_system_info(os_info)
+    info_lines = build_info_lines(info_pairs, user, hostname)
+    # 智能化分支判断：如果是图片，走图像模式（kitty 协议或彩色字符块）；如果是 txt，走传统 ASCII 路线
+    if is_image_file(config.ascii_path):
+        print_with_image_mode(config.ascii_path, info_lines)
+    else:
+        print_with_ascii_mode(config.ascii_path, info_lines, config.ascii_color)
+
+
+if __name__ == '__main__':
+    main()

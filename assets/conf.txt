@@ -1,0 +1,5 @@
+{ascii-logo} : blue
+nvazen.png
+
+{sys-info} :
+/etc/os-release
